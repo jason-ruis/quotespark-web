@@ -1,0 +1,17 @@
+.tag-badge {
+  display: inline-block;
+  background: rgba(128, 128, 128, 0.7);
+  color: white;
+  border-radius: 12px;
+  white-space: nowrap;
+}
+
+.tag-badge--normal {
+  font-size: 0.75rem;
+  padding: 4px 8px;
+}
+
+.tag-badge--small {
+  font-size: 0.65rem;
+  padding: 2px 6px;
+}
