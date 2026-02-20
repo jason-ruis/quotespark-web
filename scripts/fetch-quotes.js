@@ -1,184 +1,252 @@
 // fetch-quotes.js — ESM, Node 18+
-// Fetches quotes from WikiQuote (for specific authors) and Quotable.io (by tag),
-// deduplicates against existing quotes.json, and appends new entries.
+// Parses Obsidian book note files from the vault and extracts quotes into quotes.json.
+// Run locally: npm run fetch-quotes
+// (This script reads from your local vault; it does not run in GitHub Actions.)
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { readFileSync, writeFileSync, readdirSync } from 'fs';
+import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
-import { parse } from 'node-html-parser';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
 
-// Load config
-const config = JSON.parse(
-  readFileSync(join(ROOT, 'src/config/sources.json'), 'utf8')
-);
+const config = JSON.parse(readFileSync(join(ROOT, 'src/config/sources.json'), 'utf8'));
+const booksPath = config.booksPath;
+const today = new Date().toISOString().split('T')[0];
 
-// Load existing quotes (grows over time)
-const quotesPath = join(ROOT, 'src/data/quotes.json');
-let existingQuotes = [];
-if (existsSync(quotesPath)) {
-  existingQuotes = JSON.parse(readFileSync(quotesPath, 'utf8'));
-}
-
-// Build dedup set from normalized text
-const existingNormalized = new Set(existingQuotes.map(q => normalizeText(q.text)));
-
-function normalizeText(text) {
-  return text.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
-}
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function makeId(author, text) {
   return createHash('sha256').update(`${author}:${text}`).digest('hex').slice(0, 16);
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function normalizeText(text) {
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-const newQuotes = [];
-const today = new Date().toISOString().split('T')[0];
+function cleanText(raw) {
+  return raw
+    // Strip block references like ^f4a09c at end of lines
+    .replace(/\s*\^[a-z0-9]+$/gm, '')
+    // Strip Obsidian highlight markers ==**...**== or ==...==
+    .replace(/==\*\*(.+?)\*\*==/g, '$1')
+    .replace(/==(.+?)==/g, '$1')
+    // Strip bold and italic markdown
+    .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/\*(.+?)\*/g, '$1')
+    // Strip wikilinks [[alias|text]] or [[text]]
+    .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
+    .replace(/\[\[([^\]]+)\]\]/g, '$1')
+    // Strip trailing page numbers: (123) or (17-18)
+    .replace(/\s*\(\d+[-–\d]*\)\s*$/, '')
+    // Normalize whitespace
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-// ─── WikiQuote ───────────────────────────────────────────────────────────────
+function parseSimpleYaml(yamlStr) {
+  const result = {};
+  for (const line of yamlStr.split('\n')) {
+    const match = line.match(/^(\w[\w\s]*?):\s*(.+)$/);
+    if (match) {
+      const key = match[1].trim().toLowerCase();
+      const value = match[2].trim().replace(/^['"]|['"]$/g, '');
+      result[key] = value;
+    }
+  }
+  return result;
+}
 
-console.log('\nFetching from WikiQuote...');
+function inferAuthorFromFilename(filename) {
+  // "Title — Author Name" → author after em-dash
+  let m = filename.match(/—\s*(.+)$/);
+  if (m) return m[1].trim();
+  // "Title by Author Name" or "Title By Author Name"
+  m = filename.match(/\s+[Bb]y\s+(.+)$/);
+  if (m) return m[1].trim();
+  // "Book - Martin Bucer" → last segment after hyphen (two words, both capitalized)
+  m = filename.match(/-\s*([A-Z][a-z]+ [A-Z][a-z]+)\s*$/);
+  if (m) return m[1].trim();
+  return null;
+}
 
-for (const authorConfig of config.authors) {
-  const { name, topics } = authorConfig;
-  const pageName = name.replace(/ /g, '_');
-  const url = `https://en.wikiquote.org/w/api.php?action=parse&page=${encodeURIComponent(pageName)}&prop=text&format=json&origin=*`;
+function inferTitleFromFilename(filename) {
+  // Strip "— Author Name" suffix
+  let title = filename.replace(/\s*—\s*.+$/, '');
+  // Strip " by Author Name" suffix
+  title = title.replace(/\s+[Bb]y\s+.+$/, '');
+  // Strip "Quotes from " prefix
+  title = title.replace(/^Quotes from\s+/i, '');
+  // Strip " - Author Name" at end (two capitalized words)
+  title = title.replace(/\s+-\s*[A-Z][a-z]+ [A-Z][a-z]+\s*$/, '');
+  return title.trim();
+}
 
+function extractAuthorFromBody(body) {
+  // Match "* Author: [[Name]]" or "* Author: Name"
+  const m = body.match(/^\*\s*[Aa]uthors?:\s*(?:\[\[)?([^\]\n|,]+?)(?:\]\])?\s*$/m);
+  if (m) return m[1].trim();
+  return null;
+}
+
+function isReaderNote(line) {
+  const t = line.trim();
+  if (!t) return false;
+  if (t.startsWith('>')) return true;          // blockquote = reader note
+  if (t.startsWith('#')) return true;          // markdown header
+  if (t.startsWith('— ')) return true;         // em-dash commentary
+  if (/^\*\s*\w+:/.test(t)) return true;       // metadata list (* Author:, * ISBN:)
+  if (/^[\w][\w\s]*::/.test(t)) return true;   // Obsidian dataview field
+  if (t.startsWith('![[')) return true;         // embedded file
+  if (t.startsWith('status::') || t.startsWith('#status')) return true;
+  return false;
+}
+
+// ─── Main parser ──────────────────────────────────────────────────────────────
+
+function parseBookNote(filepath) {
+  const filename = basename(filepath, '.md');
+  let content;
   try {
-    console.log(`  ${name}`);
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'QuoteSpark/1.0 (quote-fetcher; contact via GitHub)' }
-    });
-
-    if (!response.ok) {
-      console.log(`    Skipped (HTTP ${response.status})`);
-      await sleep(500);
-      continue;
-    }
-
-    const data = await response.json();
-
-    if (data.error) {
-      console.log(`    Skipped (${data.error.code}: not found or no page)`);
-      await sleep(500);
-      continue;
-    }
-
-    const html = data.parse?.text?.['*'];
-    if (!html) {
-      console.log(`    No HTML content`);
-      await sleep(500);
-      continue;
-    }
-
-    const root = parse(html);
-    const lis = root.querySelectorAll('ul > li');
-    let count = 0;
-
-    for (const li of lis) {
-      // Strip nested ul/ol blocks (attribution lines like "As quoted in...")
-      const cleaned = li.innerHTML
-        .replace(/<ul[\s\S]*?<\/ul>/gi, '')
-        .replace(/<ol[\s\S]*?<\/ol>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        // Decode common HTML entities
-        .replace(/&amp;/g, '&')
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>');
-
-      if (cleaned.length < 40 || cleaned.length > 600) continue;
-
-      // Skip attribution/navigation lines
-      if (/^(as quoted|source:|from |see also|references|notes|edit|chapter|book |part )/i.test(cleaned)) continue;
-
-      // Skip lines that are mostly punctuation or look like section headers
-      if (/^[\W\d]+$/.test(cleaned)) continue;
-
-      const normalized = normalizeText(cleaned);
-      if (existingNormalized.has(normalized)) continue;
-
-      newQuotes.push({
-        id: makeId(name, cleaned),
-        text: cleaned,
-        author: name,
-        topics,
-        addedAt: today
-      });
-      existingNormalized.add(normalized);
-      count++;
-    }
-
-    console.log(`    +${count} quotes`);
-  } catch (err) {
-    console.error(`    Error: ${err.message}`);
+    content = readFileSync(filepath, 'utf8');
+  } catch (e) {
+    console.error(`  Could not read: ${e.message}`);
+    return [];
   }
 
-  await sleep(500);
-}
-
-// ─── Quotable.io ─────────────────────────────────────────────────────────────
-
-console.log('\nFetching from Quotable.io...');
-
-for (const tag of config.quotableTags) {
-  const url = `https://api.quotable.io/quotes?tags=${encodeURIComponent(tag)}&limit=30`;
-
-  try {
-    console.log(`  tag: ${tag}`);
-    const response = await fetch(url, {
-      headers: { 'User-Agent': 'QuoteSpark/1.0 (quote-fetcher; contact via GitHub)' }
-    });
-
-    if (!response.ok) {
-      console.log(`    Skipped (HTTP ${response.status})`);
-      continue;
+  // ── Frontmatter
+  let body = content;
+  let yamlMeta = {};
+  if (content.startsWith('---\n')) {
+    const endIdx = content.indexOf('\n---\n', 4);
+    if (endIdx !== -1) {
+      yamlMeta = parseSimpleYaml(content.slice(4, endIdx));
+      body = content.slice(endIdx + 5);
     }
-
-    const data = await response.json();
-    const results = data.results ?? [];
-    let count = 0;
-
-    for (const item of results) {
-      const text = item.content?.trim();
-      const author = item.author?.trim();
-      if (!text || !author) continue;
-      if (text.length < 40 || text.length > 600) continue;
-
-      const normalized = normalizeText(text);
-      if (existingNormalized.has(normalized)) continue;
-
-      newQuotes.push({
-        id: makeId(author, text),
-        text,
-        author,
-        topics: [tag],
-        addedAt: today
-      });
-      existingNormalized.add(normalized);
-      count++;
-    }
-
-    console.log(`    +${count} quotes`);
-  } catch (err) {
-    console.error(`    Error: ${err.message}`);
   }
 
-  await sleep(200);
+  // ── Author resolution
+  let author = (
+    yamlMeta['author'] ||
+    yamlMeta['authors'] ||
+    yamlMeta['author name'] ||
+    // Some files have capital-A "Author:" in YAML
+    Object.entries(yamlMeta).find(([k]) => k.toLowerCase() === 'author')?.[1] || ''
+  ).replace(/^\[\[|\]\]$/g, '').trim();
+
+  if (!author) author = extractAuthorFromBody(body) || '';
+  if (!author) author = inferAuthorFromFilename(filename) || 'Unknown';
+
+  // ── Book title resolution
+  const titleKey = Object.keys(yamlMeta).find(k => k.toLowerCase() === 'title');
+  const bookKey = Object.keys(yamlMeta).find(k => k.toLowerCase() === 'book');
+  let bookTitle = (
+    (titleKey ? yamlMeta[titleKey] : '') ||
+    (bookKey ? yamlMeta[bookKey] : '') || ''
+  ).trim();
+  if (!bookTitle) bookTitle = inferTitleFromFilename(filename);
+
+  // ── Topics from YAML category
+  const catKey = Object.keys(yamlMeta).find(k => k.toLowerCase() === 'category' || k.toLowerCase() === 'categories');
+  const topics = catKey
+    ? [yamlMeta[catKey].split(/[,&]/)[0].trim()].filter(Boolean)
+    : [];
+
+  // ── Split into chunks
+  const hasSections = /\n---\n/.test(body);
+  const chunks = hasSections
+    ? body.split(/\n---\n/)
+    : body.split(/\n\n+/);
+
+  const quotes = [];
+  const seen = new Set();
+
+  for (const chunk of chunks) {
+    const lines = chunk.split('\n');
+
+    // Separate quote lines from reader notes
+    const quoteLines = lines.filter(l => !isReaderNote(l) && l.trim() !== '');
+
+    if (quoteLines.length === 0) continue;
+
+    let rawText = quoteLines.join(' ');
+
+    // ── Inline attribution: (J Gresham Machen, Christianity & Liberalism, 59)
+    let resolvedAuthor = author;
+    let resolvedSource = bookTitle;
+
+    const attrMatch = rawText.match(/\(([A-Z][a-z]+(?: [A-Z][a-z]+)+),\s*([^,)]+),?\s*[\d-]+\)\s*$/);
+    if (attrMatch) {
+      resolvedAuthor = attrMatch[1].trim();
+      resolvedSource = attrMatch[2].trim();
+      rawText = rawText.slice(0, rawText.lastIndexOf('(')).trim();
+    }
+
+    const cleaned = cleanText(rawText);
+
+    // ── Length filter
+    if (cleaned.length < 40 || cleaned.length > 1000) continue;
+
+    // ── Skip all-caps section headings (e.g. "PRINCIPLE #1: DO FEWER THINGS")
+    const lettersOnly = cleaned.replace(/[^A-Za-z]/g, '');
+    if (lettersOnly.length > 4 && cleaned === cleaned.toUpperCase()) continue;
+
+    // ── Skip lone page header lines (chapter numbers, roman numerals, etc.)
+    if (/^(ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE)$/i.test(cleaned.trim())) continue;
+
+    // ── Dedup within this file
+    const norm = normalizeText(cleaned);
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+
+    quotes.push({ text: cleaned, author: resolvedAuthor, source: resolvedSource, topics });
+  }
+
+  return quotes;
 }
 
-// ─── Write updated database ───────────────────────────────────────────────────
+// ─── Run ──────────────────────────────────────────────────────────────────────
 
-const allQuotes = [...existingQuotes, ...newQuotes];
+console.log(`Reading book notes from:\n  ${booksPath}\n`);
+
+const files = readdirSync(booksPath)
+  .filter(f => f.endsWith('.md'))
+  .sort();
+
+const allQuotes = [];
+const globalSeen = new Set();
+let fileCount = 0;
+
+for (const filename of files) {
+  const filepath = join(booksPath, filename);
+  const quotes = parseBookNote(filepath);
+  let added = 0;
+
+  for (const q of quotes) {
+    const norm = normalizeText(q.text);
+    if (globalSeen.has(norm)) continue;
+    globalSeen.add(norm);
+
+    allQuotes.push({
+      id: makeId(q.author, q.text),
+      text: q.text,
+      author: q.author,
+      source: q.source,
+      topics: q.topics,
+      addedAt: today
+    });
+    added++;
+  }
+
+  if (added > 0) {
+    console.log(`  ${basename(filename, '.md')}: ${added} quotes`);
+    fileCount++;
+  }
+}
+
+const quotesPath = join(ROOT, 'src/data/quotes.json');
 writeFileSync(quotesPath, JSON.stringify(allQuotes, null, 2));
 
-console.log(`\nDone. Added ${newQuotes.length} new quotes. Total database: ${allQuotes.length} quotes.`);
+console.log(`\nDone. Extracted ${allQuotes.length} quotes from ${fileCount} books.`);
