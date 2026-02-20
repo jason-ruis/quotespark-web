@@ -36,6 +36,10 @@ function cleanText(raw) {
     .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/\*(.+?)\*/g, '$1')
+    // Strip markdown links [text](url) → keep text only
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    // Strip bare URLs that may remain
+    .replace(/https?:\/\/\S+/g, '')
     // Strip wikilinks [[alias|text]] or [[text]]
     .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
     .replace(/\[\[([^\]]+)\]\]/g, '$1')
